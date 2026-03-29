@@ -1,239 +1,270 @@
 #include "indexer.h"
+
 #include <sstream>
 #include <algorithm>
 #include <unordered_set>
+#include <unordered_map>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
+#include <sys/stat.h>
 
-Indexer::Indexer(const std::string& fname) : filename(fname) {
-    stemmer = sb_stemmer_new("english", NULL);	
-    if(stemmer == nullptr) {
-    	std::cerr << "Error: Could not initialize libstemmer for English.\n"; 
-    }	
-    int fd = open(filename.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+
+Indexer::Indexer(const std::string& hashFile, const std::string& logFile)
+    : hashFilename(hashFile), logFilename(logFile)
+{
+    stemmer = sb_stemmer_new("english", NULL);
+
+    if (stemmer == nullptr) {
+        std::cerr << "Error: Could not initialize libstemmer.\n";
+    }
+
+    int fd = open(hashFilename.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
     if (fd >= 0) {
-        Bucket emptyBucket = {0};
+        Bucket empty = {-1};
+
         for (uint64_t i = 0; i < BUCKET_COUNT; ++i) {
-            write(fd, &emptyBucket, sizeof(Bucket));
+            write(fd, &empty, sizeof(Bucket));
         }
+
         close(fd);
-    // else {
-    // 	std::cerr << "Error: File is not opened.\n";
-	//return;
-     //}
-   }
+    }
+
+    int logFd = open(logFilename.c_str(), O_RDWR | O_CREAT, 0644);
+    if (logFd >= 0) close(logFd);
 }
 
-Indexer::~Indexer() {
+
+Indexer::~Indexer()
+{
     if (stemmer) {
-    	sb_stemmer_delete(stemmer);
-	stemmer = nullptr;
-    } 
+        sb_stemmer_delete(stemmer);
+        stemmer = nullptr;
+    }
 }
 
-uint64_t Indexer::hashFunction(const std::string& key) {
-    uint64_t hash = 5381; // djb2 hash algorithm
-    for (char c : key) hash = ((hash << 5) + hash) + c; 
+
+uint64_t Indexer::hashFunction(const std::string& key)
+{
+    uint64_t hash = 5381;
+
+    for (char c : key)
+        hash = ((hash << 5) + hash) + c;
+
     return hash % BUCKET_COUNT;
 }
 
-std::vector<std::string> Indexer::tokenize(const std::string& text) {
+
+std::vector<std::string> Indexer::tokenize(const std::string& text)
+{
     std::stringstream ss(text);
     std::string word;
     std::vector<std::string> tokens;
+
     static const std::unordered_set<std::string> stopWords = {
-        "the","and","is","in","at","on","for","a","an","of"
-    };
+    "the","and","is","in","at","on","for","a","an","of",
+    "to","from","by","with","about","as","into","over","after",
+
+    "i","you","he","she","it","we","they",
+    "me","him","her","us","them",
+    "my","your","his","their","our",
+
+    "this","that","these","those",
+    "there","here",
+
+    "what","which","who","when","where","why","how",
+
+    "be","am","are","was","were","been","being",
+    "have","has","had","do","does","did",
+    "will","would","can","could","should","may","might",
+
+    "not","no","yes","ok","okay"
+};
 
     while (ss >> word) {
-        word.erase(std::remove_if(word.begin(), word.end(), ::ispunct), word.end());
-        std::transform(word.begin(), word.end(), word.begin(), ::tolower);
-        if (word.empty() || stopWords.count(word)) continue;
 
-        if (stemmer) {		
+        word.erase(std::remove_if(word.begin(), word.end(), ::ispunct), word.end());
+
+        std::transform(word.begin(), word.end(), word.begin(), ::tolower);
+
+        if (word.empty() || stopWords.count(word))
+            continue;
+
+        if (stemmer) {
             const sb_symbol* stemmed = sb_stemmer_stem(
                 stemmer,
                 reinterpret_cast<const sb_symbol*>(word.c_str()),
                 word.length()
             );
-            if (stemmed) {      
+
+            if (stemmed) {
                 tokens.push_back(reinterpret_cast<const char*>(stemmed));
             }
-        } else {
+        }
+        else {
             tokens.push_back(word);
         }
     }
+
     return tokens;
 }
 
-void Indexer::addDocument(const std::string& url, const std::string& text) {
+
+void Indexer::addDocument(uint64_t linkID, const std::string& text)
+{
     auto words = tokenize(text);
+
     std::unordered_set<std::string> uniqueWords(words.begin(), words.end());
 
-    int fd = open(filename.c_str(), O_RDWR);
-    if (fd < 0) {
-    	std::cerr << "Error: File could not be opened.\n";
-	return;
+    int hashFd = open(hashFilename.c_str(), O_RDWR);
+    int logFd = open(logFilename.c_str(), O_RDWR);
+
+    if (hashFd < 0 || logFd < 0) {
+        std::cerr << "Error opening files.\n";
+        return;
     }
 
     for (const auto& word : uniqueWords) {
-        uint64_t bucketIdx = hashFunction(word);
-        uint64_t bucketPos = bucketIdx * sizeof(Bucket);
-        
+
+        uint64_t idx = hashFunction(word);
+        uint64_t pos = idx * sizeof(Bucket);
+
         Bucket b;
-        lseek(fd, bucketPos, SEEK_SET);
-        read(fd, &b, sizeof(Bucket));
 
-        uint64_t currentOffset = b.offset;
-        uint64_t prevPointerPos = bucketPos; 
-        bool isBucketLink = true;
-        bool found = false;
+        lseek(hashFd, pos, SEEK_SET);
+        read(hashFd, &b, sizeof(Bucket));
 
-        while (currentOffset != 0) {
-            lseek(fd, currentOffset, SEEK_SET);
-            NodeHeader head;
-            read(fd, &head, sizeof(NodeHeader));
+        int64_t prev = b.offset;
 
-            std::string storedWord(head.wordLen, ' ');
-            read(fd, &storedWord[0], head.wordLen);
+        int64_t newOffset = lseek(logFd, 0, SEEK_END);
 
-            if (storedWord == word) {
-                std::vector<std::string> urls;
-                for(uint64_t i=0; i < head.numUrls; ++i) {
-                    uint64_t uLen;
-                    read(fd, &uLen, sizeof(uLen));
-                    std::string u(uLen, ' ');
-                    read(fd, &u[0], uLen);
-                    urls.push_back(u);
-                }
+        LogEntry entry;
+        strncpy(entry.word, word.c_str(), sizeof(entry.word));
+        entry.word[sizeof(entry.word) - 1] = '\0';
 
-                if (std::find(urls.begin(), urls.end(), url) == urls.end()) {
-                    urls.push_back(url);
-                    
-                    uint64_t newNodeOffset = lseek(fd, 0, SEEK_END);
-                    NodeHeader newHead = { (uint64_t)word.size(), (uint64_t)urls.size(), head.nextNodeOffset };
-                    
-                    write(fd, &newHead, sizeof(NodeHeader));
-                    write(fd, word.c_str(), word.size());
-                    for(const auto& u : urls) {
-                        uint64_t uLen = u.size();
-                        write(fd, &uLen, sizeof(uLen));
-                        write(fd, u.c_str(), uLen);
-                    }
+        entry.linkID = linkID;
+        entry.prevOffset = prev;
 
-                    lseek(fd, isBucketLink ?
-				    prevPointerPos 
-				    : (prevPointerPos + offsetof(NodeHeader, nextNodeOffset)), SEEK_SET);
-                    write(fd, &newNodeOffset, sizeof(uint64_t));
-                }
-                found = true;
-                break;
-            }
-            isBucketLink = false;
-            prevPointerPos = currentOffset;
-            currentOffset = head.nextNodeOffset;
-        }
+        write(logFd, &entry, sizeof(entry));
 
-        if (!found) {
-            uint64_t newNodeOffset = lseek(fd, 0, SEEK_END);
-            NodeHeader newHead = { (uint64_t)word.size(), 1, 0 };
-            
-            write(fd, &newHead, sizeof(NodeHeader));
-            write(fd, word.c_str(), word.size());
-            uint64_t uLen = url.size();
-            write(fd, &uLen, sizeof(uLen));
-            write(fd, url.c_str(), uLen);
-
-            lseek(fd, isBucketLink ? prevPointerPos : (prevPointerPos + offsetof(NodeHeader, nextNodeOffset)), SEEK_SET);
-            write(fd, &newNodeOffset, sizeof(uint64_t));
-        }
+        lseek(hashFd, pos, SEEK_SET);
+        write(hashFd, &newOffset, sizeof(int64_t));
     }
-    close(fd);
+
+    close(hashFd);
+    close(logFd);
 }
 
-std::vector<std::string> Indexer::search(const std::string& query) {
-    auto qWords = tokenize(query);
-    if (qWords.empty()) return {};
 
-    int fd = open(filename.c_str(), O_RDONLY);
-    if (fd < 0) {
-    	std::cerr << "Error: File could not be opened.\n";
-	return {};
+void Indexer::compact()
+{
+    int oldFd = open(logFilename.c_str(), O_RDONLY);
+    if (oldFd < 0) return;
+
+    int newFd = open("posts_new.log", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (newFd < 0) {
+        close(oldFd);
+        return;
     }
 
-    auto getUrls = [&](const std::string& word) -> std::vector<std::string> {
-        uint64_t bucketIdx = hashFunction(word);
-        lseek(fd, bucketIdx * sizeof(Bucket), SEEK_SET);
-        Bucket b;
-        read(fd, &b, sizeof(Bucket));
+    std::unordered_map<std::string, LogEntry> latest;
 
-        uint64_t currentOffset = b.offset;
-        while (currentOffset != 0) {
-            lseek(fd, currentOffset, SEEK_SET);
-            NodeHeader head;
-            read(fd, &head, sizeof(NodeHeader));
+    off_t offset = 0;
+    LogEntry entry;
 
-            std::string storedWord(head.wordLen, ' ');
-            read(fd, &storedWord[0], head.wordLen);
+    while (pread(oldFd, &entry, sizeof(entry), offset) == sizeof(entry)) {
 
-            if (storedWord == word) {
-                std::vector<std::string> urls;
-                for (uint64_t i = 0; i < head.numUrls; ++i) {
-                    uint64_t uLen;
-                    read(fd, &uLen, sizeof(uLen));
-                    std::string u(uLen, ' ');
-                    read(fd, &u[0], uLen);
-                    urls.push_back(u);
-                }
-                return urls;
-            }
-            currentOffset = head.nextNodeOffset;
-        }
+        std::string key = std::string(entry.word) + "_" + std::to_string(entry.linkID);
+
+        latest[key] = entry;
+
+        offset += sizeof(entry);
+    }
+
+    for (auto& [key, val] : latest) {
+
+        val.prevOffset = -1;
+        write(newFd, &val, sizeof(LogEntry));
+    }
+
+    close(oldFd);
+    close(newFd);
+
+    remove(logFilename.c_str());
+    rename("posts_new.log", logFilename.c_str());
+}
+
+std::vector<uint64_t> Indexer::search(const std::string& query)
+{
+    auto words = tokenize(query);
+
+    if (words.empty())
         return {};
+
+    int hashFd = open(hashFilename.c_str(), O_RDONLY);
+    int logFd  = open(logFilename.c_str(), O_RDONLY);
+
+    if (hashFd < 0 || logFd < 0) {
+        std::cerr << "Error opening files.\n";
+        return {};
+    }
+
+    auto getList = [&](const std::string& word) {
+
+        std::vector<uint64_t> res;
+
+        uint64_t idx = hashFunction(word);
+
+        lseek(hashFd, idx * sizeof(Bucket), SEEK_SET);
+
+        Bucket b;
+        read(hashFd, &b, sizeof(Bucket));
+
+        int64_t offset = b.offset;
+
+        while (offset != -1) {
+
+            lseek(logFd, offset, SEEK_SET);
+
+            LogEntry entry;
+            read(logFd, &entry, sizeof(entry));
+
+            if (std::string(entry.word) == word) {
+                res.push_back(entry.linkID);
+            }
+
+            offset = entry.prevOffset;
+        }
+
+        return res;
     };
 
-    std::vector<std::vector<std::string>> lists;
+    auto firstList = getList(words[0]);
 
-    for (const auto& word : qWords) {
-        auto urls = getUrls(word);
-        if (urls.empty()) {
-            close(fd);
-            return {};
-        }
-        lists.push_back(std::move(urls));
-    }
+    std::unordered_set<uint64_t> result(firstList.begin(), firstList.end());
+    std::unordered_set<uint64_t> temp;
 
-    std::sort(lists.begin(), lists.end(),
-        [](const auto& a, const auto& b) {
-            return a.size() < b.size();
-        });
+    for (size_t i = 1; i < words.size(); i++) {
 
-    std::unordered_set<std::string> resultSet(
-        lists[0].begin(), lists[0].end());
+        auto list = getList(words[i]);
 
-    for (size_t i = 1; i < lists.size(); ++i) {
+        temp.clear();
 
-        std::unordered_set<std::string> nextSet(
-            lists[i].begin(), lists[i].end());
-
-        std::unordered_set<std::string> newSet;
-
-        for (const auto& url : resultSet) {
-            if (nextSet.count(url)) {
-                newSet.insert(url);
+        for (auto id : list) {
+            if (result.count(id)) {
+                temp.insert(id);
             }
         }
-        resultSet = std::move(newSet);
 
-        if (resultSet.empty()) break;
+        result = temp;
+
+        if (result.empty())
+            break;
     }
 
-    close(fd);
+    close(hashFd);
+    close(logFd);
 
-    return std::vector<std::string>(
-        resultSet.begin(),
-        resultSet.end()
-    );
+    return std::vector<uint64_t>(result.begin(), result.end());
 }

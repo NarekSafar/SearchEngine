@@ -39,15 +39,28 @@ std::string HtmlParser::extractText(const std::string& html) {
     GumboOutput* gumboOutput = gumbo_parse(html.c_str());
     std::string result;
     extractTextFromNode(gumboOutput->root, result);
-    gumbo_destroy_output(&kGumboDefaultOptions, gumboOutput);
+    
     return result;
 }
-  
+
+std::string HtmlParser::getDomain(const std::string& url) {
+    size_t protocolEnd = url.find("://");
+    if (protocolEnd == std::string::npos) return "";
+
+    size_t domainEnd = url.find('/', protocolEnd + 3);
+
+    if (domainEnd == std::string::npos)
+        return url;
+
+    return url.substr(0, domainEnd);
+}
+
 std::vector<std::string> HtmlParser::extractLinks(const std::string& html, const std::string& baseUrl) {
     std::vector<std::string> links;
     std::regex linkRegex("<a\\s+[^>]*href=\"([^\"]+)\"");
     auto begin = std::sregex_iterator(html.begin(), html.end(), linkRegex);
     auto end = std::sregex_iterator();
+    std::string domain = getDomain(baseUrl);
 
     for (auto it = begin; it != end; ++it) {
         std::string link = (*it)[1];
@@ -55,12 +68,12 @@ std::vector<std::string> HtmlParser::extractLinks(const std::string& html, const
         if (link.empty()) continue;
 
         if (link.find("http") == 0) {
-            if (link.find(baseUrl) == 0) {  
+            if (link.find(domain) == 0) {
                 links.push_back(link);
             }
         }
         else if (link[0] == '/') {
-            links.push_back(baseUrl + link);
+            links.push_back(domain + link);
         }
     }
     return links;

@@ -6,6 +6,8 @@
 #include <mutex>
 #include <vector>
 #include <chrono>
+#include <sys/stat.h>
+#include <atomic>
 
 #include "argparse/argparse.hpp"
 
@@ -19,6 +21,36 @@ std::unordered_map<std::string, std::chrono::steady_clock::time_point> inProgres
 
 std::mutex queueMutex;
 std::mutex indexMutex;
+
+std::unordered_map<std::string, uint64_t> urlToId;
+std::vector<std::string> idToUrl;
+std::mutex urlMapMutex;
+uint64_t nextId = 0;
+
+std::atomic<bool> compacting(false);
+std::atomic<bool> stopWorkers(false);
+
+const uint64_t MAX_LOG_SIZE = 1ULL * 1024 * 1024 * 1024;
+
+uint64_t getFileSize(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    return st.st_size;
+}
+
+uint64_t getUrlId(const std::string& url) {
+    std::lock_guard<std::mutex> lock(urlMapMutex);
+
+    auto it = urlToId.find(url);
+    if (it != urlToId.end())
+        return it->second;
+
+    uint64_t id = nextId++;
+    urlToId[url] = id;
+    idToUrl.push_back(url);
+
+    return id;
+}
 
 const int TASK_TIMEOUT = 30;
 
@@ -65,13 +97,16 @@ void worker(Indexer& indexer, int maxPages) {
 
             recoverTimedOutTasks();
 
-            if (urlQueue.empty() || visited.size() >= maxPages)
+            if (stopWorkers.load() || (int)visited.size() >= maxPages)
                 return;
+
+            if (urlQueue.empty())
+                continue;
 
             currentUrl = urlQueue.front();
             urlQueue.pop();
 
-            if (visited.count(currentUrl))
+            if (visited.count(currentUrl) || inProgress.count(currentUrl))
                 continue;
 
             inProgress[currentUrl] = std::chrono::steady_clock::now();
@@ -91,13 +126,14 @@ void worker(Indexer& indexer, int maxPages) {
 
                 if (consecutiveErrors >= 5) {
                     std::cerr << "Too many consecutive errors. Stopping crawl.\n";
-                    exit(1);
+                    stopWorkers.store(true);
                 }
             }
 
-            urlQueue.push(currentUrl);
-            inProgress.erase(currentUrl);
-
+	    if (!visited.count(currentUrl) && !inProgress.count(currentUrl)) {
+    	   	 urlQueue.push(currentUrl);
+	    }
+	    inProgress.erase(currentUrl);
             continue;
         } else {
             std::lock_guard<std::mutex> eLock(errorMutex);
@@ -106,9 +142,11 @@ void worker(Indexer& indexer, int maxPages) {
 
         std::string text = parser.extractText(html);
 
-        if (!text.empty()) {
+        if (!text.empty() && !compacting.load()) {
             std::lock_guard<std::mutex> lock(indexMutex);
-            indexer.addDocument(currentUrl, text);
+
+            uint64_t linkID = getUrlId(currentUrl);
+            indexer.addDocument(linkID, text);
         }
 
         auto links = parser.extractLinks(html, currentUrl);
@@ -120,7 +158,7 @@ void worker(Indexer& indexer, int maxPages) {
             visited.insert(currentUrl);
 
             for (auto& link : links) {
-                if (!visited.count(link))
+                if (!visited.count(link) && !inProgress.count(link))
                     urlQueue.push(link);
             }
         }
@@ -129,26 +167,27 @@ void worker(Indexer& indexer, int maxPages) {
 
 int main(int argc, char* argv[]) {
 
-    argparse::ArgumentParser program("Search engine");
+    argparse::ArgumentParser program("./search_engine");
 
     program.add_argument("-u", "--url")
         .required()
         .help("Base URL");
 
     program.add_argument("-m", "--max-pages")
-    .required()
-    .scan<'i', int>()
-    .help("Maximum number of pages")
-    .action([](const std::string& value) {
-        int v = std::stoi(value);
-        if (v <= 0)
-            throw std::runtime_error("max-pages must be positive");
-        return v;
-    });
+        .required()
+        .scan<'i', int>()
+        .help("Maximum number of pages")
+	.action([](const std::string& value) {
+		     int v = std::stoi(value);
+		     if (v <= 0) throw
+		     std::runtime_error("max-pages must be positive");
+		     return v; 
+		     }
+		);
 
     program.add_argument("-i", "--index")
         .required()
-        .help("Index file");
+        .help("Base name for index files (without extension)");
 
     try {
         program.parse_args(argc, argv);
@@ -161,14 +200,14 @@ int main(int argc, char* argv[]) {
 
     std::string url = program.get<std::string>("--url");
     int maxPages = program.get<int>("--max-pages");
-    std::string indexFile = program.get<std::string>("--index");
+    std::string base = program.get<std::string>("--index");
 
     urlQueue.push(url);
 
     unsigned int cores = std::thread::hardware_concurrency();
     int workerCount = std::min(maxPages, (int)std::max(1u, cores * 2));
 
-    Indexer indexer(indexFile);
+    Indexer indexer(base + ".bin", base + ".log");
 
     std::vector<std::thread> workers;
 
@@ -176,24 +215,61 @@ int main(int argc, char* argv[]) {
         workers.emplace_back(worker, std::ref(indexer), maxPages);
     }
 
+    std::thread compactionThread([&]() {
+
+        while (!stopWorkers.load()) {
+
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+
+            uint64_t size = getFileSize(base + ".log");
+
+            if (size > MAX_LOG_SIZE && !compacting.load()) {
+
+                std::cout << "\n[COMPACTION START]\n";
+
+                compacting.store(true);
+
+                {
+                    std::lock_guard<std::mutex> lock(indexMutex);
+                    indexer.compact();
+                }
+
+                compacting.store(false);
+
+                std::cout << "[COMPACTION DONE]\n";
+            }
+        }
+    });
+
     for (auto& t : workers)
         t.join();
+
+    stopWorkers.store(true);
+
+    compactionThread.join();
 
     while (true) {
         std::string query;
         std::cout << "\nEnter search query (or type exit): ";
         std::getline(std::cin, query);
         query = trim(query);
+
         if (query == "exit") break;
         if (query.empty()) continue;
+
         auto results = indexer.search(query);
 
         if (results.empty()) {
             std::cout << "No results found.\n";
         } else {
             std::cout << "Results:\n";
-            for (auto& r : results) std::cout << r << "\n";
+
+            for (auto id : results) {
+                if (id < idToUrl.size())
+                    std::cout << idToUrl[id] << "\n";
+            }
         }
     }
+
     return 0;
 }

@@ -3,34 +3,39 @@
 
 #include <string>
 #include <vector>
-#include <cstdint>
+#include <unordered_set>
 #include <libstemmer.h>
+#include <stdint.h>
+
+struct Bucket {
+    int64_t offset;
+};
+
+struct LogEntry {
+    char word[32];	
+    uint64_t linkID;
+    int64_t prevOffset;
+};
 
 class Indexer {
 public:
-    explicit Indexer(const std::string& fname);
+    Indexer(const std::string& hashFile, const std::string& logFile);
     ~Indexer();
-    void addDocument(const std::string& url, const std::string& text);
-    std::vector<std::string> search(const std::string& query);
+
+    void addDocument(uint64_t linkID, const std::string& text);
+    std::vector<uint64_t> search(const std::string& query);
+    void compact();
 
 private:
-    std::string filename;
-    static const uint64_t BUCKET_COUNT = 10007; 
+    std::string hashFilename;
+    std::string logFilename;
 
-    struct sb_stemmer* stemmer;
+    sb_stemmer* stemmer;
 
-    std::vector<std::string> tokenize(const std::string& text);
+    static const uint64_t BUCKET_COUNT = 10007;
+
     uint64_t hashFunction(const std::string& key);
-    
-    struct Bucket {
-        uint64_t offset;
-    };
-
-    struct NodeHeader {
-        uint64_t wordLen;
-        uint64_t numUrls;
-        uint64_t nextNodeOffset; 
-    };
+    std::vector<std::string> tokenize(const std::string& text);
 };
 
 #endif
