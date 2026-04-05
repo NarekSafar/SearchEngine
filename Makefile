@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -pthread
+CXXFLAGS = -std=c++17 -Wall -Wextra -pthread -MMD -MP
 
 LIBS = -lcurl -lgumbo -lstemmer
 
@@ -9,6 +9,7 @@ SRC = main.cpp \
       indexer/indexer.cpp
 
 OBJ = $(SRC:.cpp=.o)
+DEP = $(OBJ:.o=.d)
 
 TARGET = search_engine
 
@@ -20,10 +21,12 @@ $(TARGET): $(OBJ)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+-include $(DEP)
+
 run: $(TARGET)
 	./$(TARGET)
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(DEP) $(TARGET)
 
 .PHONY: all run clean

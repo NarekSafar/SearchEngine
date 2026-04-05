@@ -15,6 +15,7 @@ public:
 
 private:
     void extractTextFromNode(GumboNode* node, std::string& output);
+    bool isCrawlableLink(const std::string& url);
     std::string getDomain(const std::string& url); 
 };
 

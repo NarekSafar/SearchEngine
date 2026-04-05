@@ -32,7 +32,7 @@ private:
 
     sb_stemmer* stemmer;
 
-    static const uint64_t BUCKET_COUNT = 10007;
+    static const uint64_t BUCKET_COUNT = 1000003;
 
     uint64_t hashFunction(const std::string& key);
     std::vector<std::string> tokenize(const std::string& text);
