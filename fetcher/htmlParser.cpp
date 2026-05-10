@@ -90,7 +90,7 @@ std::vector<std::string> HtmlParser::extractLinks(const std::string& html, const
 
         if (link.empty()) continue;
 
-        if (link[0] == '#') continue;
+        if (link.find('#') != std::string::npos) continue;
         if (link.find("javascript:") == 0) continue;
         if (link.find("mailto:") == 0) continue;
 
@@ -102,7 +102,7 @@ std::vector<std::string> HtmlParser::extractLinks(const std::string& html, const
                 fullLink = link;
             }
         }
-        else if (link[0] == '/') {
+        else if (link[0] == '/' && link.find('#') == std::string::npos) {	
             fullLink = domain + link;
         }
 

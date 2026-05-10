@@ -1,32 +1,40 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -pthread -MMD -MP
+
+CXXFLAGS = -std=c++17 -Wall -Wextra -pthread -MMD -MP -Icpp-httplib -Iargparse -I.
 
 LIBS = -lcurl -lgumbo -lstemmer
 
-SRC = main.cpp \
-      crawler/pageLoader.cpp \
-      crawler/htmlParser.cpp \
-      indexer/indexer.cpp
+CRAWLER_SRC = crawler.cpp \
+              fetcher/pageLoader.cpp \
+              fetcher/htmlParser.cpp \
+              indexer/indexer.cpp
 
-OBJ = $(SRC:.cpp=.o)
-DEP = $(OBJ:.o=.d)
+SEARCH_SRC = search_server.cpp \
+             indexer/indexer.cpp
 
-TARGET = search_engine
+CRAWLER_OBJ = $(CRAWLER_SRC:.cpp=.o)
+SEARCH_OBJ = $(SEARCH_SRC:.cpp=.o)
 
-all: $(TARGET)
+CRAWLER = crawler
+SEARCH = search
 
-$(TARGET): $(OBJ)
-	$(CXX) $(OBJ) -o $(TARGET) $(LIBS)
+all: $(CRAWLER) $(SEARCH)
+
+$(CRAWLER): $(CRAWLER_OBJ)
+	$(CXX) $(CRAWLER_OBJ) -o $(CRAWLER) $(LIBS)
+
+$(SEARCH): $(SEARCH_OBJ)
+	$(CXX) $(SEARCH_OBJ) -o $(SEARCH) $(LIBS)
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
--include $(DEP)
-
-run: $(TARGET)
-	./$(TARGET)
+-include $(CRAWLER_OBJ:.o=.d)
+-include $(SEARCH_OBJ:.o=.d)
 
 clean:
-	rm -f $(OBJ) $(DEP) $(TARGET)
+	find . -type f -name "*.o" -delete
+	find . -type f -name "*.d" -delete
+	rm -f $(CRAWLER) $(SEARCH)
 
-.PHONY: all run clean
+.PHONY: all clean
